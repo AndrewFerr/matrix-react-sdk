@@ -20,6 +20,7 @@ import {
     IOpenIDCredentials,
     IOpenIDUpdate,
     ISendEventDetails,
+    ISendFutureDetails,
     ITurnServer,
     IReadEventRelationsResult,
     IRoomEvent,
@@ -37,6 +38,8 @@ import {
 import {
     ClientEvent,
     ITurnServer as IClientTurnServer,
+    ISendActionFutureResponse,
+    ISendTimeoutFutureResponse,
     EventType,
     IContent,
     MatrixEvent,
@@ -144,13 +147,29 @@ export class StopGapWidgetDriver extends WidgetDriver {
             this.allowedCapabilities.add(
                 WidgetEventCapability.forStateEvent(EventDirection.Receive, EventType.RoomEncryption).raw,
             );
+            const clientUserId = MatrixClientPeg.safeGet().getSafeUserId();
             this.allowedCapabilities.add(
-                WidgetEventCapability.forStateEvent(
-                    EventDirection.Send,
-                    "org.matrix.msc3401.call.member",
-                    MatrixClientPeg.safeGet().getSafeUserId(),
-                ).raw,
+                WidgetEventCapability.forStateEvent(EventDirection.Send, "org.matrix.msc3401.call.member", clientUserId)
+                    .raw,
             );
+            const clientDeviceId = MatrixClientPeg.safeGet().getDeviceId();
+            if (clientDeviceId !== null) {
+                this.allowedCapabilities.add(
+                    WidgetEventCapability.forStateEvent(
+                        EventDirection.Send,
+                        "org.matrix.msc3401.call.member",
+                        `_${clientUserId}_${clientDeviceId}`,
+                    ).raw,
+                );
+                // MSC3779 version, with no leading underscore
+                this.allowedCapabilities.add(
+                    WidgetEventCapability.forStateEvent(
+                        EventDirection.Send,
+                        "org.matrix.msc3401.call.member",
+                        `${clientUserId}_${clientDeviceId}`,
+                    ).raw,
+                );
+            }
             this.allowedCapabilities.add(
                 WidgetEventCapability.forStateEvent(EventDirection.Receive, "org.matrix.msc3401.call.member").raw,
             );
@@ -308,6 +327,78 @@ export class StopGapWidgetDriver extends WidgetDriver {
         }
 
         return { roomId, eventId: r.event_id };
+    }
+
+    public async sendFuture<K extends keyof StateEvents>(
+        futureGroupId: string | null,
+        futureTimeout: number | null,
+        eventType: K,
+        content: StateEvents[K],
+        stateKey?: string,
+        targetRoomId?: string,
+    ): Promise<ISendFutureDetails>;
+    public async sendFuture<K extends keyof TimelineEvents>(
+        futureGroupId: string | null,
+        futureTimeout: number | null,
+        eventType: K,
+        content: TimelineEvents[K],
+        stateKey: null,
+        targetRoomId?: string,
+    ): Promise<ISendFutureDetails>;
+    public async sendFuture(
+        futureGroupId: string | null,
+        futureTimeout: number | null,
+        eventType: string,
+        content: IContent,
+        stateKey?: string | null,
+        targetRoomId?: string,
+    ): Promise<ISendFutureDetails> {
+        const client = MatrixClientPeg.get();
+        const roomId = targetRoomId || SdkContextClass.instance.roomViewStore.getRoomId();
+
+        if (!client || !roomId) throw new Error("Not in a room or not attached to a client");
+
+        let futureOpts;
+        if (futureTimeout !== null) {
+            futureOpts = {
+                future_timeout: futureTimeout,
+                ...(futureGroupId !== null && { future_group_id: futureGroupId }),
+            };
+        } else if (futureGroupId !== null) {
+            futureOpts = {
+                future_group_id: futureGroupId,
+            };
+        } else {
+            throw new Error("Must provide at least one of futureGroupId or futureTimeout");
+        }
+
+        let r: ISendActionFutureResponse | ISendTimeoutFutureResponse | null;
+        if (stateKey !== null) {
+            // state event
+            r = await client._unstable_sendStateFuture(
+                roomId,
+                futureOpts,
+                eventType as keyof StateEvents,
+                content as StateEvents[keyof StateEvents],
+                stateKey,
+            );
+        } else {
+            // message event
+            r = await client._unstable_sendFuture(
+                roomId,
+                futureOpts,
+                eventType as keyof TimelineEvents,
+                content as TimelineEvents[keyof TimelineEvents],
+            );
+        }
+
+        return {
+            roomId,
+            futureGroupId: r.future_group_id,
+            sendToken: r.send_token,
+            cancelToken: r.cancel_token,
+            ...("refresh_token" in r && { refreshToken: r.refresh_token }),
+        };
     }
 
     public async sendToDevice(
